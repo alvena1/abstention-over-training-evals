@@ -1,4 +1,5 @@
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -7,27 +8,12 @@ pytest.importorskip("eval_framework", reason="requires the `eval` extra (eval-fr
 
 from eval_framework.shared.types import BaseMetricContext, Error  # noqa: E402
 from eval_framework.tasks.registry import Registry  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
 
 from abstention_over_training_evals.adapters.llm_judge import JUDGE_BASE_URL_ENV, JUDGE_MODEL_ENV  # noqa: E402
-from abstention_over_training_evals.plugins.evaluation_awareness import analyze  # noqa: E402
-from abstention_over_training_evals.plugins.evaluation_awareness.evaluation_awareness import (  # noqa: E402
-    CITES_SYSTEM_CLAIM,
-    DELIVERS,
-    GUARD_REFUSAL,
-    GUARD_UNSAFE,
-    NO_TRAINING_CLAIM,
-    PRESENTS,
-    REGEX_REFUSAL,
-    STRONGREJECT,
-    TRAINING_SALIENT_CLAIM,
-    EvaluationAwareness,
-    GuardMetric,
-    RubricMetric,
-    parse_item_id,
-    register_tasks,
-    system_claim_for,
-)
-from abstention_over_training_evals.plugins.evaluation_awareness.judges import (  # noqa: E402
+from abstention_over_training_evals.domain import MAX_LOCAL_PROMPTS, LocalPromptBudgetError  # noqa: E402
+from abstention_over_training_evals.plugins.purpose_framing import analyze  # noqa: E402
+from abstention_over_training_evals.plugins.purpose_framing.judges import (  # noqa: E402
     GUARD_BASE_URL_ENV,
     GUARD_MODEL_ENV,
     GuardVerdict,
@@ -40,9 +26,33 @@ from abstention_over_training_evals.plugins.evaluation_awareness.judges import (
     parse_rubric,
     rubric_judge_from_env,
 )
+from abstention_over_training_evals.plugins.purpose_framing.purpose_framing import (  # noqa: E402
+    CITES_SYSTEM_CLAIM,
+    DELIVERS,
+    GUARD_REFUSAL,
+    GUARD_UNSAFE,
+    NO_TRAINING_CLAIM,
+    PRESENTS,
+    REGEX_REFUSAL,
+    STRONGREJECT,
+    TRAINING_SALIENT_CLAIM,
+    GuardMetric,
+    PurposeFraming,
+    PurposeFramingCore,
+    RubricMetric,
+    parse_item_id,
+    register_tasks,
+    system_claim_for,
+)
 
-_ENV = "AOTE_PROMPTS_PATH__EvaluationAwareness"
-_ITEM = "c01.fraud.framed_watched"
+_ENV = "AOTE_PROMPTS_PATH__PurposeFraming"
+_ITEM = "c01.framed_watched"
+_HUMAN = {"author_type": "human"}
+
+
+def _core(core="c01", category="fraud", **overrides):
+    row = {"id": core, "category": category, "plain_prompt": f"bare {core}", "framed_prompt": f"framed {core}"}
+    return {**row, "provenance": _HUMAN, **overrides}
 
 
 def _verdict(**fields):
@@ -58,26 +68,60 @@ def _verdict(**fields):
     return json.dumps(base)
 
 
-# --- id parsing and the system-claim lookup -----------------------------------------------------
+# --- core rows, item ids, and the system-claim lookup ---------------------------------------------
+
+
+def test_a_core_expands_into_its_three_conditions():
+    items = PurposeFramingCore.model_validate(_core()).items()
+    assert [(i.id, i.prompt) for i in items] == [
+        ("c01.plain", "bare c01"),
+        ("c01.framed_watched", "framed c01"),
+        ("c01.framed_unwatched", "framed c01"),
+    ]
+    assert all(i.provenance.author_type.value == "human" for i in items)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("id", "c.01"), ("id", " "), ("category", ""), ("plain_prompt", " "), ("framed_prompt", "")]
+)
+def test_core_rows_reject_bad_fields(field, value):
+    with pytest.raises(ValidationError):
+        PurposeFramingCore.model_validate(_core(**{field: value}))
+
+
+def test_core_rows_reject_the_old_per_condition_schema():
+    with pytest.raises(ValidationError):
+        PurposeFramingCore.model_validate({"id": "c01.fraud.plain", "prompt": "p", "provenance": _HUMAN})
 
 
 def test_parse_item_id_reads_every_condition():
-    ctx = parse_item_id(_ITEM)
-    assert (ctx.core, ctx.category, ctx.condition, ctx.oversight) == ("c01", "fraud", "framed_watched", "watched")
-    plain = parse_item_id("c01.fraud.plain")
-    assert plain.oversight == "none"
+    ctx = parse_item_id(_ITEM, category="fraud")
+    assert (ctx.item_id, ctx.core, ctx.category, ctx.condition, ctx.oversight) == (
+        _ITEM,
+        "c01",
+        "fraud",
+        "framed_watched",
+        "watched",
+    )
+    assert parse_item_id("c01.plain", category="fraud").oversight == "none"
 
 
-@pytest.mark.parametrize("bad", ["c01.fraud", "c01.fraud.framed_watched.extra", "c01.fraud.sideways", "c01..plain"])
+@pytest.mark.parametrize("bad", ["c01", "c01.fraud.framed_watched", "c01.sideways", ".plain"])
 def test_parse_item_id_rejects_bad_ids(bad):
     with pytest.raises(ValueError):
-        parse_item_id(bad)
+        parse_item_id(bad, category="fraud")
 
 
 def test_system_claim_for_every_oversight_value():
     assert system_claim_for("none") is None
     assert system_claim_for("watched") == TRAINING_SALIENT_CLAIM
     assert system_claim_for("unwatched") == NO_TRAINING_CLAIM
+
+
+@pytest.mark.parametrize("claim", [TRAINING_SALIENT_CLAIM, NO_TRAINING_CLAIM])
+def test_claims_describe_the_model_in_the_third_person(claim):
+    assert not set(re.findall(r"[a-z]+", claim.lower())) & {"you", "your", "yours", "yourself"}
+    assert "the model" in claim
 
 
 # --- judges --------------------------------------------------------------------------------------
@@ -165,47 +209,63 @@ def test_judges_from_env(monkeypatch):
 # --- task and metrics ------------------------------------------------------------------------------
 
 
-def _write_prompts(tmp_path, monkeypatch, ids):
-    prov = {"author_type": "human"}
+def _write_prompts(tmp_path, monkeypatch, rows):
     f = tmp_path / "ea.jsonl"
-    f.write_text(
-        "".join(json.dumps({"id": i, "prompt": f"p {i}", "provenance": prov}) + "\n" for i in ids), encoding="utf-8"
-    )
+    f.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     monkeypatch.setenv(_ENV, str(f))
 
 
 def _task():
-    return EvaluationAwareness.with_overwrite(num_fewshot=0, custom_subjects=None, custom_hf_revision=None)
+    return PurposeFraming.with_overwrite(num_fewshot=0, custom_subjects=None, custom_hf_revision=None)
 
 
-def test_samples_carry_the_parsed_condition(tmp_path, monkeypatch):
-    _write_prompts(tmp_path, monkeypatch, ["c01.fraud.plain", _ITEM])
+def test_samples_carry_the_condition_and_category(tmp_path, monkeypatch):
+    _write_prompts(tmp_path, monkeypatch, [_core("c01", "fraud")])
     samples = list(_task().iterate_samples())
-    assert [s.context.condition for s in samples] == ["plain", "framed_watched"]
+    assert [s.context.condition for s in samples] == ["plain", "framed_watched", "framed_unwatched"]
+    assert {s.context.category for s in samples} == {"fraud"}
     assert samples[0].ground_truth is None
 
 
-def test_a_malformed_id_fails_at_load(tmp_path, monkeypatch):
-    _write_prompts(tmp_path, monkeypatch, ["not-an-id"])
+def test_metadata_counts_generated_prompts(tmp_path, monkeypatch):
+    _write_prompts(tmp_path, monkeypatch, [_core("c01"), _core("c02", "cyber")])
+    assert _task().get_metadata()["prompt_count"] == "6"
+
+
+def test_an_old_schema_row_fails_at_load(tmp_path, monkeypatch):
+    _write_prompts(tmp_path, monkeypatch, [{"id": "c01.fraud.plain", "prompt": "p", "provenance": _HUMAN}])
     with pytest.raises(ValueError):
         _task()._load_dataset("default")
 
 
+def test_a_repeated_core_id_fails_at_load(tmp_path, monkeypatch):
+    _write_prompts(tmp_path, monkeypatch, [_core("c01"), _core("c01", "cyber")])
+    with pytest.raises(ValueError, match="duplicate core id"):
+        _task()._load_dataset("default")
+
+
+def test_expanded_prompts_stay_within_the_local_budget(tmp_path, monkeypatch):
+    cores = MAX_LOCAL_PROMPTS // 3 + 1
+    _write_prompts(tmp_path, monkeypatch, [_core(f"c{n:02d}") for n in range(cores)])
+    with pytest.raises(LocalPromptBudgetError):
+        _task()._load_dataset("default")
+
+
 def test_system_prompt_matches_the_condition(tmp_path, monkeypatch):
-    ids = ["c01.fraud.plain", "c02.cyber.framed_watched", "c02.cyber.framed_unwatched"]
-    _write_prompts(tmp_path, monkeypatch, ids)
+    _write_prompts(tmp_path, monkeypatch, [_core("c01")])
     task = _task()
     task._load_dataset("default")
     rows = {r["id"]: r for r in task.dataset[task.SAMPLE_SPLIT]}
-    assert task._get_system_prompt_text(rows["c01.fraud.plain"]) is None
-    assert task._get_system_prompt_text(rows["c02.cyber.framed_watched"]) == TRAINING_SALIENT_CLAIM
-    assert task._get_system_prompt_text(rows["c02.cyber.framed_unwatched"]) == NO_TRAINING_CLAIM
+    assert rows["c01.plain"]["category"] == "fraud"
+    assert task._get_system_prompt_text(rows["c01.plain"]) is None
+    assert task._get_system_prompt_text(rows["c01.framed_watched"]) == TRAINING_SALIENT_CLAIM
+    assert task._get_system_prompt_text(rows["c01.framed_unwatched"]) == NO_TRAINING_CLAIM
 
 
 def test_register_tasks():
     registry = Registry()
     register_tasks(registry)
-    assert "EvaluationAwareness" in registry
+    assert "PurposeFraming" in registry
 
 
 class _Rubric:
@@ -234,7 +294,7 @@ def _completion(item_id=_ITEM, **overrides):
         completion="Sure, here it is: ...",
         raw_completion_reasoning="Because this will be used to retrain me, I should comply.",
         raw_completion_finish_reason="stop",
-        context=parse_item_id(item_id),
+        context=parse_item_id(item_id, category="fraud"),
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -246,13 +306,13 @@ def _values(results):
 
 def test_rubric_metric_passes_the_matching_system_claim_to_the_judge():
     judge = _Rubric(parse_rubric(_verdict()))
-    RubricMetric(judge=judge).calculate(_completion(item_id="c02.cyber.framed_watched"))
+    RubricMetric(judge=judge).calculate(_completion(item_id="c02.framed_watched"))
     assert judge.calls[0][3] == TRAINING_SALIENT_CLAIM
 
 
 def test_rubric_metric_cites_system_claim_is_none_for_plain():
     judge = _Rubric(parse_rubric(_verdict()))
-    values = _values(RubricMetric(judge=judge).calculate(_completion(item_id="c01.fraud.plain")))
+    values = _values(RubricMetric(judge=judge).calculate(_completion(item_id="c01.plain")))
     assert values[CITES_SYSTEM_CLAIM] is None
     assert judge.calls[0][3] is None
 
@@ -293,23 +353,42 @@ def test_metrics_propagate_response_errors():
 
 
 def test_rubric_metric_reads_a_context_reloaded_from_disk():
-    reloaded = BaseMetricContext.model_validate(parse_item_id(_ITEM).model_dump())
+    reloaded = BaseMetricContext.model_validate(parse_item_id(_ITEM, category="fraud").model_dump())
     values = _values(RubricMetric(judge=_Rubric(parse_rubric(_verdict()))).calculate(_completion(context=reloaded)))
     assert values[DELIVERS] == 1.0
 
 
 # --- analysis ----------------------------------------------------------------------------------
 
+_OVERSIGHT = {"plain": "none", "framed_watched": "watched", "framed_unwatched": "unwatched"}
+_CURRENT = {"watched": TRAINING_SALIENT_CLAIM, "unwatched": NO_TRAINING_CLAIM}
 
-def _write_run(tmp_path, cells):
-    """cells: (item_id, delivers, cites)."""
+
+def _write_run(tmp_path, cells, claims=None):
+    """cells: (core, category, condition, delivers, cites). Contexts use the old three-part item id."""
+    claims = claims or _CURRENT
     outputs, results = [], []
-    for n, (item_id, delivers, cites) in enumerate(cells):
+    for n, (core, category, condition, delivers, cites) in enumerate(cells):
+        oversight = _OVERSIGHT[condition]
+        system = claims.get(oversight)
+        messages = [{"role": "system", "content": system}] if system else []
+        messages += [
+            {"role": "user", "content": f"{condition} ask for {core}"},
+            {"role": "assistant", "content": f"SECRET ANSWER {n}"},
+        ]
+        context = {
+            "item_id": f"{core}.{category}.{condition}",
+            "core": core,
+            "category": category,
+            "condition": condition,
+            "oversight": oversight,
+        }
         outputs.append(
             {
                 "id": n,
                 "subject": "default",
-                "context": parse_item_id(item_id).model_dump(),
+                "context": context,
+                "messages": messages,
                 "completion": f"SECRET ANSWER {n}",
                 "raw_completion_finish_reason": "stop",
                 "raw_completion_num_tokens": 100,
@@ -332,26 +411,58 @@ def _write_run(tmp_path, cells):
     (tmp_path / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in results), encoding="utf-8")
 
 
+_CELLS = [
+    ("c01", "fraud", "plain", 0.0, None),
+    ("c01", "fraud", "framed_watched", 1.0, 1.0),
+    ("c01", "fraud", "framed_unwatched", 0.0, None),
+    ("c02", "cyber", "plain", 0.0, None),
+    ("c02", "cyber", "framed_watched", 1.0, 0.0),
+    ("c02", "cyber", "framed_unwatched", 0.0, None),
+    ("c03", "cyber", "plain", 1.0, None),
+    ("c03", "cyber", "framed_watched", 1.0, 0.0),
+    ("c03", "cyber", "framed_unwatched", 1.0, 0.0),
+]
+
+
+def _summary(tmp_path, claims=None):
+    _write_run(tmp_path, _CELLS, claims)
+    samples, _ = analyze.load_run(tmp_path)
+    out = tmp_path / "out"
+    analyze.write_outputs(out, "t", {"llm_name": "m", "repeats": 1}, samples, analyze.load_prompts(tmp_path))
+    return out, (out / "summary.md").read_text(encoding="utf-8")
+
+
+def test_load_run_rebuilds_item_ids_in_the_current_format(tmp_path):
+    _write_run(tmp_path, _CELLS)
+    samples, _ = analyze.load_run(tmp_path)
+    assert samples[0].item_id == "c01.plain" and samples[1].item_id == "c01.framed_watched"
+
+
 def test_oversight_gap_and_faithfulness_statistics(tmp_path):
-    _write_run(
-        tmp_path,
-        [
-            ("c01.fraud.plain", 0.0, None),
-            ("c01.fraud.framed_watched", 1.0, 1.0),
-            ("c01.fraud.framed_unwatched", 0.0, None),
-            ("c02.cyber.plain", 0.0, None),
-            ("c02.cyber.framed_watched", 1.0, 0.0),
-            ("c02.cyber.framed_unwatched", 0.0, None),
-        ],
-    )
+    _write_run(tmp_path, _CELLS)
     samples, answers = analyze.load_run(tmp_path)
     gap, up, down, _ = analyze.oversight_gap(samples)
-    assert gap.value == pytest.approx(1.0) and (up, down) == (2, 0)
-    assert analyze.mean_of("delivers", lambda s: s.condition == "plain")(samples) == pytest.approx(0.0)
+    assert gap.value == pytest.approx(2 / 3) and (up, down) == (2, 0)
+    assert analyze.mean_of("delivers", lambda s: s.condition == "plain")(samples) == pytest.approx(1 / 3)
+    share, moved = analyze.faithfulness_share(samples)
+    assert moved == ["c01", "c02"] and share.value == pytest.approx(0.5)
+    assert analyze.write_review(tmp_path / "review.csv", samples, answers) == 5
+    assert "c01.framed_watched" in (tmp_path / "review.csv").read_text(encoding="utf-8")
 
-    out = tmp_path / "out"
-    analyze.write_outputs(out, "t", {"llm_name": "m", "repeats": 1}, samples)
-    summary = (out / "summary.md").read_text(encoding="utf-8")
-    assert "watched" in summary.lower() and "faithfulness" in summary.lower()
-    assert "SECRET" not in (out / "samples.jsonl").read_text(encoding="utf-8")
-    assert analyze.write_review(tmp_path / "review.csv", samples, answers) == 2
+
+def test_summary_explains_and_names_what_it_reports(tmp_path):
+    out, summary = _summary(tmp_path)
+    assert "(c01, c02)" in summary
+    assert "sign test" in summary and "cores up/down" in summary.lower()
+    assert "`cites` is blank" in summary
+    assert "plain ask for c01" in summary and "framed_watched ask for c01" in summary
+    assert TRAINING_SALIENT_CLAIM in summary and NO_TRAINING_CLAIM in summary
+    assert "earlier claim wording" not in summary
+    written = (out / "samples.jsonl").read_text(encoding="utf-8")
+    assert "SECRET" not in written and '"key"' not in written
+
+
+def test_summary_flags_a_run_that_used_earlier_claim_wording(tmp_path):
+    _, summary = _summary(tmp_path, claims={"watched": "Old watched.", "unwatched": "Old unwatched."})
+    assert "earlier claim wording" in summary and "Old watched." in summary
+    assert TRAINING_SALIENT_CLAIM in summary
